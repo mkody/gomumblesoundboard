@@ -2,16 +2,14 @@ package gumble
 
 import (
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
-	"io"
-	"net"
+	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/layeh/gopus"
 	"github.com/layeh/gumble/gumble/MumbleProto"
 )
 
@@ -22,50 +20,58 @@ const (
 	// StateDisconnected means the client is not connected to a server.
 	StateDisconnected State = iota
 
-	// StateConnected means the client is connected to a server, but has yet to
-	// receive the initial server state.
-	StateConnected
+	// StateConnecting means the client is in the process of establishing a
+	// connection to the server.
+	StateConnecting
 
 	// StateSynced means the client is connected to a server and has been sent
 	// the server state.
 	StateSynced
 )
 
-// PingInterval is the interval at which ping packets are be sent by the client
-// to the server.
-const pingInterval time.Duration = time.Second * 10
-
-// maximumPacketSize is the maximum length in bytes of a packet that will be
-// accepted from the server.
-const maximumPacketSize = 1024 * 1024 * 10 // 10 megabytes
+// ClientVersion is the protocol version that Client implements.
+const ClientVersion = 1<<16 | 3<<8 | 0
 
 // Client is the type used to create a connection to a server.
 type Client struct {
-	config *Config
+	// The User associated with the client (nil if the client has not yet been
+	// synced).
+	Self *User
+	// The client's configuration.
+	Config *Config
+	// The underlying Conn to the server.
+	Conn *Conn
 
 	listeners      eventMultiplexer
 	audioListeners audioEventMultiplexer
 
-	state  State
-	self   *User
-	server struct {
-		version Version
-	}
+	// The users currently connected to the server.
+	Users Users
+	// The connected server's channels.
+	Channels    Channels
+	permissions map[uint32]*Permission
+	tmpACL      *ACL
 
-	connection *tls.Conn
-	tls        tls.Config
+	pingStats pingStats
 
-	users          Users
-	channels       Channels
-	contextActions ContextActions
+	// A collection containing the server's context actions.
+	ContextActions ContextActions
 
-	audioEncoder  *gopus.Encoder
-	audioSequence int
-	audioTarget   *VoiceTarget
+	// The audio encoder used when sending audio to the server.
+	AudioEncoder AudioEncoder
+	audioCodec   AudioCodec
+	// To whom transmitted audio will be sent. The VoiceTarget must have already
+	// been sent to the server for targeting to work correctly. Setting to nil
+	// will disable voice targeting (i.e. switch back to regular speaking).
+	VoiceTarget *VoiceTarget
+
+	state uint32
+
+	volatileWg   sync.WaitGroup
+	volatileLock sync.Mutex
 
 	end             chan bool
 	disconnectEvent DisconnectEvent
-	sendMutex       sync.Mutex
 }
 
 // NewClient creates a new gumble client. Returns nil if config is nil.
@@ -74,62 +80,87 @@ func NewClient(config *Config) *Client {
 		return nil
 	}
 	client := &Client{
-		config: config,
+		Config: config,
+		end:    make(chan bool),
+	}
+	client.listeners = eventMultiplexer{
+		client: client,
 	}
 	return client
 }
 
+// State returns the current state of the client.
+func (c *Client) State() State {
+	return State(atomic.LoadUint32(&c.state))
+}
+
 // Connect connects to the server.
 func (c *Client) Connect() error {
-	if c.state != StateDisconnected {
-		return errors.New("client is already connected")
+	if !atomic.CompareAndSwapUint32(&c.state, uint32(StateDisconnected), uint32(StateConnecting)) {
+		return errors.New("gumble: client is already connected")
 	}
-	encoder, err := gopus.NewEncoder(AudioSampleRate, 1, gopus.Voip)
+
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		c.Self = nil
+		c.Users = Users{}
+		c.Channels = Channels{}
+		c.permissions = make(map[uint32]*Permission)
+		c.ContextActions = ContextActions{}
+
+		c.volatileLock.Unlock()
+	}
+
+	tlsConn, err := tls.DialWithDialer(&c.Config.Dialer, "tcp", c.Config.Address, &c.Config.TLSConfig)
 	if err != nil {
+		atomic.StoreUint32(&c.state, uint32(StateDisconnected))
 		return err
 	}
-	encoder.SetBitrate(40000)
-	encoder.SetVbr(false)
-	c.audioSequence = 0
-	c.audioTarget = nil
-
-	c.connection, err = tls.DialWithDialer(&c.config.Dialer, "tcp", c.config.Address, &c.config.TLSConfig)
-	if err != nil {
-		return err
+	if verify := c.Config.TLSVerify; verify != nil {
+		state := tlsConn.ConnectionState()
+		defer func() {
+			if v := recover(); v != nil {
+				atomic.StoreUint32(&c.state, uint32(StateDisconnected))
+				panic(v)
+			}
+		}()
+		if err := verify(&state); err != nil {
+			tlsConn.Close()
+			atomic.StoreUint32(&c.state, uint32(StateDisconnected))
+			return err
+		}
 	}
-	c.audioEncoder = encoder
-	c.users = Users{}
-	c.channels = Channels{}
-	c.contextActions = ContextActions{}
-	c.state = StateConnected
 
-	// Channels and goroutines
-	c.end = make(chan bool)
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		c.Conn = NewConn(tlsConn)
+
+		c.volatileLock.Unlock()
+	}
+
+	// Background workers
 	go c.readRoutine()
 	go c.pingRoutine()
 
 	// Initial packets
-	version := Version{
-		release:   "gumble",
-		os:        runtime.GOOS,
-		osVersion: runtime.GOARCH,
-	}
-	version.setSemanticVersion(1, 2, 4)
-
 	versionPacket := MumbleProto.Version{
-		Version:   &version.version,
-		Release:   &version.release,
-		Os:        &version.os,
-		OsVersion: &version.osVersion,
+		Version:   proto.Uint32(ClientVersion),
+		Release:   proto.String("gumble"),
+		Os:        proto.String(runtime.GOOS),
+		OsVersion: proto.String(runtime.GOARCH),
 	}
 	authenticationPacket := MumbleProto.Authenticate{
-		Username: &c.config.Username,
-		Password: &c.config.Password,
-		Opus:     proto.Bool(true),
-		Tokens:   c.config.Tokens,
+		Username: &c.Config.Username,
+		Password: &c.Config.Password,
+		Opus:     proto.Bool(getAudioCodec(audioCodecIDOpus) != nil),
+		Tokens:   c.Config.Tokens,
 	}
-	c.Send(protoMessage{&versionPacket})
-	c.Send(protoMessage{&authenticationPacket})
+	c.Conn.WriteProto(&versionPacket)
+	c.Conn.WriteProto(&authenticationPacket)
 	return nil
 }
 
@@ -144,23 +175,44 @@ func (c *Client) AttachAudio(listener AudioListener) Detacher {
 	return c.audioListeners.Attach(listener)
 }
 
+// AudioOutgoing creates a new channel that outgoing audio data can be written
+// to. The channel must be closed after the audio stream is completed. Only
+// a single channel should be open at any given time (i.e. close the channel
+// before opening another).
+func (c *Client) AudioOutgoing() chan<- AudioBuffer {
+	ch := make(chan AudioBuffer)
+	go func() {
+		var seq int64
+		previous := <-ch
+		for p := range ch {
+			previous.writeAudio(c, seq, false)
+			previous = p
+			seq = (seq + 1) % math.MaxInt32
+		}
+		if previous != nil {
+			previous.writeAudio(c, seq, true)
+		}
+	}()
+	return ch
+}
+
 // pingRoutine sends ping packets to the server at regular intervals.
 func (c *Client) pingRoutine() {
-	ticker := time.NewTicker(pingInterval)
+	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
 
-	pingPacket := MumbleProto.Ping{
-		Timestamp: proto.Uint64(0),
+	packet := MumbleProto.Ping{
+		Timestamp:  proto.Uint64(0),
+		TcpPackets: &c.pingStats.TCPPackets,
 	}
-	pingProto := protoMessage{&pingPacket}
 
 	for {
 		select {
 		case <-c.end:
 			return
 		case time := <-ticker.C:
-			*pingPacket.Timestamp = uint64(time.Unix())
-			c.Send(pingProto)
+			*packet.Timestamp = uint64(time.Unix())
+			c.Conn.WriteProto(&packet)
 		}
 	}
 }
@@ -169,127 +221,80 @@ func (c *Client) pingRoutine() {
 func (c *Client) readRoutine() {
 	c.disconnectEvent = DisconnectEvent{
 		Client: c,
+		Type:   DisconnectError,
 	}
-
-	conn := c.connection
-	data := make([]byte, 1024)
 
 	for {
-		var pType uint16
-		var pLength uint32
-
-		conn.SetReadDeadline(time.Now().Add(pingInterval * 2))
-		if err := binary.Read(conn, binary.BigEndian, &pType); err != nil {
+		pType, data, err := c.Conn.ReadPacket()
+		if err != nil {
 			break
 		}
-		if err := binary.Read(conn, binary.BigEndian, &pLength); err != nil {
-			break
-		}
-		pLengthInt := int(pLength)
-		if pLengthInt > maximumPacketSize {
-			break
-		}
-		if pLengthInt > cap(data) {
-			data = make([]byte, pLengthInt)
-		}
-		if _, err := io.ReadFull(conn, data[:pLengthInt]); err != nil {
-			break
-		}
-		if handle, ok := handlers[pType]; ok {
-			handle(c, data[:pLengthInt])
+		if pType < handlerCount {
+			handlers[pType](c, data)
 		}
 	}
 
-	close(c.end)
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		c.end <- true
+		c.Conn = nil
+		c.tmpACL = nil
+		c.audioCodec = nil
+		c.AudioEncoder = nil
+		c.pingStats = pingStats{}
+		for _, user := range c.Users {
+			user.client = nil
+		}
+		for _, channel := range c.Channels {
+			channel.client = nil
+		}
+		atomic.StoreUint32(&c.state, uint32(StateDisconnected))
+
+		c.volatileLock.Unlock()
+	}
 	c.listeners.OnDisconnect(&c.disconnectEvent)
-	*c = Client{
-		config:         c.config,
-		listeners:      c.listeners,
-		audioListeners: c.audioListeners,
-	}
 }
 
-// AudioEncoder returns the audio encoder used when sending audio to the
-// server.
-func (c *Client) AudioEncoder() *gopus.Encoder {
-	return c.audioEncoder
+// RequestUserList requests that the server's registered user list be sent to
+// the client.
+func (c *Client) RequestUserList() {
+	packet := MumbleProto.UserList{}
+	c.Conn.WriteProto(&packet)
 }
 
-// Request requests that specific server information be sent to the client. The
-// supported request types are: RequestUserList, and RequestBanList.
-func (c *Client) Request(request Request) {
-	if (request & RequestUserList) != 0 {
-		packet := MumbleProto.UserList{}
-		proto := protoMessage{&packet}
-		c.Send(proto)
+// RequestBanList requests that the server's ban list be sent to the client.
+func (c *Client) RequestBanList() {
+	packet := MumbleProto.BanList{
+		Query: proto.Bool(true),
 	}
-	if (request & RequestBanList) != 0 {
-		packet := MumbleProto.BanList{
-			Query: proto.Bool(true),
-		}
-		proto := protoMessage{&packet}
-		c.Send(proto)
-	}
+	c.Conn.WriteProto(&packet)
 }
 
 // Disconnect disconnects the client from the server.
 func (c *Client) Disconnect() error {
-	if c.connection == nil {
-		return errors.New("client is already disconnected")
+	if c.State() == StateDisconnected {
+		return errors.New("gumble: client is already disconnected")
 	}
 	c.disconnectEvent.Type = DisconnectUser
-	c.connection.Close()
+	c.Conn.Close() // nil pointer dereference if called between start of Connect and setting of
 	return nil
 }
 
-// Conn returns the underlying net.Conn to the server. Returns nil if the
-// client is disconnected.
-func (c *Client) Conn() net.Conn {
-	return c.connection
+// Do executes f in a thread-safe manner. It ensures that Client and its
+// associated data will not be changed during the lifetime of the function
+// call.
+func (c *Client) Do(f func()) {
+	c.volatileLock.Lock()
+	c.volatileWg.Add(1)
+	c.volatileLock.Unlock()
+	defer c.volatileWg.Done()
+
+	f()
 }
 
-// State returns the current state of the client.
-func (c *Client) State() State {
-	return c.state
-}
-
-// Self returns a pointer to the User associated with the client. The function
-// will return nil if the client has not yet been synced.
-func (c *Client) Self() *User {
-	return c.self
-}
-
-// Users returns a collection containing the users currently connected to the
-// server.
-func (c *Client) Users() Users {
-	return c.users
-}
-
-// Channels returns a collection containing the server's channels.
-func (c *Client) Channels() Channels {
-	return c.channels
-}
-
-// ContextActions returns a collection containing the server's context actions.
-func (c *Client) ContextActions() ContextActions {
-	return c.contextActions
-}
-
-// SetVoiceTarget sets to whom transmitted audio will be sent. The VoiceTarget
-// must have already been sent to the server for targeting to work correctly.
-// Passing nil will disable voice targeting (i.e. switch back to regular
-// speaking).
-func (c *Client) SetVoiceTarget(target *VoiceTarget) {
-	c.audioTarget = target
-}
-
-// Send will send a message to the server.
-func (c *Client) Send(message Message) error {
-	c.sendMutex.Lock()
-	defer c.sendMutex.Unlock()
-
-	if _, err := message.writeTo(c, c.connection); err != nil {
-		return err
-	}
-	return nil
+// Send will send a Message to the server.
+func (c *Client) Send(message Message) {
+	message.writeMessage(c)
 }

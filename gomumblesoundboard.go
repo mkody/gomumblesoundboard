@@ -4,27 +4,32 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"os"
+//	"os"
 	"path/filepath"
 
 	"github.com/go-martini/martini"
 	"github.com/layeh/gumble/gumble"
-	"github.com/layeh/gumble/gumble_ffmpeg"
+	"github.com/layeh/gumble/gumbleffmpeg"
 	"github.com/layeh/gumble/gumbleutil"
+	_ "github.com/layeh/gumble/opus"
 )
 
 func main() {
 	files := make(map[string]string)
-	var stream *gumble_ffmpeg.Stream
-	targetChannel := flag.String("channel", "Root", "channel the bot will join")
+	var stream *gumbleffmpeg.Stream
+	//targetChannel := flag.String("channel", "Root", "channel the bot will join")
 
-	gumbleutil.Main(func(_ *gumble.Config, client *gumble.Client) {
+	gumbleutil.Main(func(client *gumble.Client) {
+		/*
 		var err error
-		stream, err = gumble_ffmpeg.New(client)
+		stream, err = gumbleffmpeg.New(client)
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			os.Exit(1)
 		}
+		*/
+
+		client.Attach(gumbleutil.AutoBitrate)
 
 		for _, file := range flag.Args() {
 			key := filepath.Base(file)
@@ -34,6 +39,7 @@ func main() {
 		// Connect event
 		Connect: func(e *gumble.ConnectEvent) {
 			fmt.Printf("GoMumbleSoundboard loaded (%d files)\n", len(files))
+			/*
 			fmt.Printf("Connected to %s\n", e.Client.Conn().RemoteAddr())
 			if e.WelcomeMessage != "" {
 				fmt.Printf("Welcome message: %s\n", e.WelcomeMessage)
@@ -45,6 +51,7 @@ func main() {
 				e.Client.Self().Move(target)
 				fmt.Printf("Moved to: %s\n", target.Name())
 			}
+			*/
 
 			// Start webserver
 			m := martini.Classic()
@@ -62,8 +69,14 @@ func main() {
 				if !ok {
 					return 404, "not found"
 				}
-				stream.Stop()
-				if err := stream.Play(file); err != nil {
+
+				if stream != nil && stream.State() == gumbleffmpeg.StatePlaying {
+					stream.Stop()
+				}
+
+				stream = gumbleffmpeg.New(e.Client, gumbleffmpeg.SourceFile(file))
+
+				if err := stream.Play(); err != nil {
 					return 400, fmt.Sprintf("%s\n", err)
 				} else {
 					return 200, fmt.Sprintf("Playing %s\n", file)
@@ -77,3 +90,4 @@ func main() {
 		},
 	})
 }
+

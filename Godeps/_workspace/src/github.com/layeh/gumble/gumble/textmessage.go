@@ -1,8 +1,6 @@
 package gumble
 
 import (
-	"io"
-
 	"github.com/layeh/gumble/gumble/MumbleProto"
 )
 
@@ -11,42 +9,37 @@ import (
 type TextMessage struct {
 	// User who sent the message (can be nil).
 	Sender *User
-
 	// Users that receive the message.
 	Users []*User
-
 	// Channels that receive the message.
 	Channels []*Channel
-
 	// Channels that receive the message and send it recursively to sub-channels.
 	Trees []*Channel
-
 	// Chat message.
 	Message string
 }
 
-func (pm *TextMessage) writeTo(client *Client, w io.Writer) (int64, error) {
+func (tm *TextMessage) writeMessage(client *Client) error {
 	packet := MumbleProto.TextMessage{
-		Message: &pm.Message,
+		Message: &tm.Message,
 	}
-	if pm.Users != nil {
-		packet.Session = make([]uint32, len(pm.Users))
-		for i, user := range pm.Users {
-			packet.Session[i] = user.session
+	if tm.Users != nil {
+		packet.Session = make([]uint32, len(tm.Users))
+		for i, user := range tm.Users {
+			packet.Session[i] = user.Session
 		}
 	}
-	if pm.Channels != nil {
-		packet.ChannelId = make([]uint32, len(pm.Channels))
-		for i, channel := range pm.Channels {
-			packet.ChannelId[i] = channel.id
+	if tm.Channels != nil {
+		packet.ChannelId = make([]uint32, len(tm.Channels))
+		for i, channel := range tm.Channels {
+			packet.ChannelId[i] = channel.ID
 		}
 	}
-	if pm.Trees != nil {
-		packet.TreeId = make([]uint32, len(pm.Trees))
-		for i, channel := range pm.Trees {
-			packet.TreeId[i] = channel.id
+	if tm.Trees != nil {
+		packet.TreeId = make([]uint32, len(tm.Trees))
+		for i, channel := range tm.Trees {
+			packet.TreeId[i] = channel.ID
 		}
 	}
-	proto := protoMessage{&packet}
-	return proto.writeTo(client, w)
+	return client.Conn.WriteProto(&packet)
 }

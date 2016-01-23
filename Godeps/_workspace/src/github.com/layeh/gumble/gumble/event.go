@@ -6,6 +6,11 @@ import (
 
 // EventListener is the interface that must be implemented by a type if it
 // wishes to be notified of Client events.
+//
+// Listener methods are executed synchronously as event happen. They also block
+// network reads from happening until all handlers for an event are called.
+// Therefore, it is not recommended to do any long processing from inside of
+// these methods.
 type EventListener interface {
 	OnConnect(e *ConnectEvent)
 	OnDisconnect(e *DisconnectEvent)
@@ -14,16 +19,17 @@ type EventListener interface {
 	OnChannelChange(e *ChannelChangeEvent)
 	OnPermissionDenied(e *PermissionDeniedEvent)
 	OnUserList(e *UserListEvent)
-	OnAcl(e *AclEvent)
+	OnACL(e *ACLEvent)
 	OnBanList(e *BanListEvent)
 	OnContextActionChange(e *ContextActionChangeEvent)
+	OnServerConfig(e *ServerConfigEvent)
 }
 
 // ConnectEvent is the event that is passed to EventListener.OnConnect.
 type ConnectEvent struct {
 	Client         *Client
-	WelcomeMessage string
-	MaximumBitrate int
+	WelcomeMessage *string
+	MaximumBitrate *int
 }
 
 // DisconnectType specifies why a Client disconnected from a server.
@@ -31,7 +37,9 @@ type DisconnectType int
 
 // Client disconnect reasons.
 const (
-	DisconnectError DisconnectType = 0xFF - iota
+	DisconnectError DisconnectType = 0xFE - iota
+	DisconnectKicked
+	DisconnectBanned
 	DisconnectUser
 
 	DisconnectOther             DisconnectType = DisconnectType(MumbleProto.Reject_None)
@@ -109,8 +117,11 @@ const (
 	ChannelChangeRemoved
 	ChannelChangeMoved
 	ChannelChangeName
+	ChannelChangeLinks
 	ChannelChangeDescription
 	ChannelChangePosition
+	ChannelChangePermission
+	ChannelChangeMaxUsers
 )
 
 // Has returns true if the ChannelChangeType has changeType part of its
@@ -169,10 +180,10 @@ type UserListEvent struct {
 	UserList RegisteredUsers
 }
 
-// AclEvent is the event that is passed to EventListener.OnAcl.
-type AclEvent struct {
+// ACLEvent is the event that is passed to EventListener.OnACL.
+type ACLEvent struct {
 	Client *Client
-	Acl    *Acl
+	ACL    *ACL
 }
 
 // BanListEvent is the event that is passed to EventListener.OnBanList.
@@ -196,4 +207,26 @@ type ContextActionChangeEvent struct {
 	Client        *Client
 	Type          ContextActionChangeType
 	ContextAction *ContextAction
+}
+
+// ServerConfigEvent is the event that is passed to
+// EventListener.OnServerConfig.
+type ServerConfigEvent struct {
+	Client *Client
+
+	MaximumBitrate            *int
+	WelcomeMessage            *string
+	AllowHTML                 *bool
+	MaximumMessageLength      *int
+	MaximumImageMessageLength *int
+	MaximumUsers              *int
+
+	CodecAlpha       *int32
+	CodecBeta        *int32
+	CodecPreferAlpha *bool
+	CodecOpus        *bool
+
+	SuggestVersion    *Version
+	SuggestPositional *bool
+	SuggestPushToTalk *bool
 }

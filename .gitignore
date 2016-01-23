@@ -1,1 +1,11 @@
+# Built binary
 gomumblesoundboard
+
+# Certificates
+*.pem
+
+# Folder with our files
+mp3/
+
+# Personnal script
+start.sh

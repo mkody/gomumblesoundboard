@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 
 	"github.com/layeh/gumble/gumble"
 )
@@ -14,7 +16,7 @@ import (
 // --certificate, and --key.
 //
 // If init is non-nil, it is called before attempting to connect to the server.
-func Main(init func(config *gumble.Config, client *gumble.Client), listener gumble.EventListener) {
+func Main(init func(client *gumble.Client), listener gumble.EventListener) {
 	server := flag.String("server", "localhost:64738", "Mumble server address")
 	username := flag.String("username", "gumble-bot", "client username")
 	password := flag.String("password", "", "client password")
@@ -26,15 +28,20 @@ func Main(init func(config *gumble.Config, client *gumble.Client), listener gumb
 		flag.Parse()
 	}
 
+	host, port, err := net.SplitHostPort(*server)
+	if err != nil {
+		host = *server
+		port = strconv.Itoa(gumble.DefaultPort)
+	}
+
 	keepAlive := make(chan bool)
 
 	// client
-	config := gumble.Config{
-		Username: *username,
-		Password: *password,
-		Address:  *server,
-	}
-	client := gumble.NewClient(&config)
+	config := gumble.NewConfig()
+	config.Username = *username
+	config.Password = *password
+	config.Address = net.JoinHostPort(host, port)
+	client := gumble.NewClient(config)
 	if *insecure {
 		config.TLSConfig.InsecureSkipVerify = true
 	}
@@ -49,6 +56,7 @@ func Main(init func(config *gumble.Config, client *gumble.Client), listener gumb
 			config.TLSConfig.Certificates = append(config.TLSConfig.Certificates, certificate)
 		}
 	}
+	client.Attach(AutoBitrate)
 	client.Attach(listener)
 	client.Attach(Listener{
 		Disconnect: func(e *gumble.DisconnectEvent) {
@@ -56,7 +64,7 @@ func Main(init func(config *gumble.Config, client *gumble.Client), listener gumb
 		},
 	})
 	if init != nil {
-		init(&config, client)
+		init(client)
 	}
 	if err := client.Connect(); err != nil {
 		fmt.Printf("%s: %s\n", os.Args[0], err)

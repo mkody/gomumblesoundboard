@@ -1,12 +1,13 @@
 package gopus
 
-// #cgo pkg-config: opus
-// #include "gopus.h"
+// #cgo !nopkgconfig pkg-config: opus
+// #include <opus.h>
 //
 // enum {
-//   gopus_application_voip = OPUS_APPLICATION_VOIP,
-//   gopus_application_audio = OPUS_APPLICATION_AUDIO,
+//   gopus_application_voip    = OPUS_APPLICATION_VOIP,
+//   gopus_application_audio   = OPUS_APPLICATION_AUDIO,
 //   gopus_restricted_lowdelay = OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+//   gopus_bitrate_max         = OPUS_BITRATE_MAX,
 // };
 //
 //
@@ -23,6 +24,20 @@ package gopus
 //   opus_encoder_ctl(encoder, OPUS_GET_BITRATE(&bitrate));
 //   return bitrate;
 // }
+//
+// void gopus_setapplication(OpusEncoder *encoder, int application) {
+//   opus_encoder_ctl(encoder, OPUS_SET_APPLICATION(application));
+// }
+//
+// opus_int32 gopus_application(OpusEncoder *encoder) {
+//   opus_int32 application;
+//   opus_encoder_ctl(encoder, OPUS_GET_APPLICATION(&application));
+//   return application;
+// }
+//
+// void gopus_encoder_resetstate(OpusEncoder *encoder) {
+//   opus_encoder_ctl(encoder, OPUS_RESET_STATE);
+// }
 import "C"
 
 import (
@@ -35,6 +50,10 @@ const (
 	Voip               Application = C.gopus_application_voip
 	Audio              Application = C.gopus_application_audio
 	RestrictedLowDelay Application = C.gopus_restricted_lowdelay
+)
+
+const (
+	BitrateMaximum = C.gopus_bitrate_max
 )
 
 type Encoder struct {
@@ -85,4 +104,16 @@ func (e *Encoder) SetBitrate(bitrate int) {
 
 func (e *Encoder) Bitrate() int {
 	return int(C.gopus_bitrate(e.cEncoder))
+}
+
+func (e *Encoder) SetApplication(application Application) {
+	C.gopus_setapplication(e.cEncoder, C.int(application))
+}
+
+func (e *Encoder) Application() Application {
+	return Application(C.gopus_application(e.cEncoder))
+}
+
+func (e *Encoder) ResetState() {
+	C.gopus_encoder_resetstate(e.cEncoder)
 }

@@ -82,7 +82,7 @@ get('/files.json').then(function(resp){
     var btn = document.createElement("button");
     btn.classList.add("sound");
     btn.classList.add("play");
-    btn.innerHTML = file;
+    btn.innerHTML = file.replace(/\.[^/.]+$/, "");
     btn.dataset.file = file;
     wrapEl.appendChild(btn);
   });

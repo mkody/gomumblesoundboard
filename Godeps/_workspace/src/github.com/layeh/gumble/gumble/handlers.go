@@ -1,165 +1,202 @@
 package gumble
 
 import (
-	"bytes"
+	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"math"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/layeh/gopus"
 	"github.com/layeh/gumble/gumble/MumbleProto"
 	"github.com/layeh/gumble/gumble/varint"
 )
 
-type handlerFunc func(*Client, []byte) error
-
 var (
-	errUnimplementedHandler = errors.New("the handler has not been implemented")
-	errIncompleteProtobuf   = errors.New("protobuf message is missing a required field")
-	errInvalidProtobuf      = errors.New("protobuf message has an invalid field")
+	errUnimplementedHandler = errors.New("gumble: the handler has not been implemented")
+	errIncompleteProtobuf   = errors.New("gumble: protobuf message is missing a required field")
+	errInvalidProtobuf      = errors.New("gumble: protobuf message has an invalid field")
+	errUnsupportedAudio     = errors.New("gumble: unsupported audio codec")
+	errNoCodec              = errors.New("gumble: no audio codec")
 )
 
-var handlers map[uint16]handlerFunc
+type handlerFunc func(*Client, []byte) error
 
-func init() {
-	handlers = map[uint16]handlerFunc{
-		0:  handleVersion,
-		1:  handleUdpTunnel,
-		2:  handleAuthenticate,
-		3:  handlePing,
-		4:  handleReject,
-		5:  handleServerSync,
-		6:  handleChannelRemove,
-		7:  handleChannelState,
-		8:  handleUserRemove,
-		9:  handleUserState,
-		10: handleBanList,
-		11: handleTextMessage,
-		12: handlePermissionDenied,
-		13: handleAcl,
-		14: handleQueryUsers,
-		15: handleCryptSetup,
-		16: handleContextActionModify,
-		17: handleContextAction,
-		18: handleUserList,
-		19: handleVoiceTarget,
-		20: handlePermissionQuery,
-		21: handleCodecVersion,
-		22: handleUserStats,
-		23: handleRequestBlob,
-		24: handleServerConfig,
-		25: handleSuggestConfig,
-	}
+const handlerCount = 26
+
+var handlers = [handlerCount]handlerFunc{
+	(*Client).handleVersion,
+	(*Client).handleUDPTunnel,
+	(*Client).handleAuthenticate,
+	(*Client).handlePing,
+	(*Client).handleReject,
+	(*Client).handleServerSync,
+	(*Client).handleChannelRemove,
+	(*Client).handleChannelState,
+	(*Client).handleUserRemove,
+	(*Client).handleUserState,
+	(*Client).handleBanList,
+	(*Client).handleTextMessage,
+	(*Client).handlePermissionDenied,
+	(*Client).handleACL,
+	(*Client).handleQueryUsers,
+	(*Client).handleCryptSetup,
+	(*Client).handleContextActionModify,
+	(*Client).handleContextAction,
+	(*Client).handleUserList,
+	(*Client).handleVoiceTarget,
+	(*Client).handlePermissionQuery,
+	(*Client).handleCodecVersion,
+	(*Client).handleUserStats,
+	(*Client).handleRequestBlob,
+	(*Client).handleServerConfig,
+	(*Client).handleSuggestConfig,
 }
 
 func parseVersion(packet *MumbleProto.Version) Version {
 	var version Version
 	if packet.Version != nil {
-		version.version = *packet.Version
+		version.Version = *packet.Version
 	}
 	if packet.Release != nil {
-		version.release = *packet.Release
+		version.Release = *packet.Release
 	}
 	if packet.Os != nil {
-		version.os = *packet.Os
+		version.OS = *packet.Os
 	}
 	if packet.OsVersion != nil {
-		version.osVersion = *packet.OsVersion
+		version.OSVersion = *packet.OsVersion
 	}
 	return version
 }
 
-func handleVersion(c *Client, buffer []byte) error {
+func (c *Client) handleVersion(buffer []byte) error {
 	var packet MumbleProto.Version
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
 	}
-
-	c.server.version = parseVersion(&packet)
 	return nil
 }
 
-func handleUdpTunnel(c *Client, buffer []byte) error {
-	reader := bytes.NewReader(buffer)
-	var bytesRead int64
-
-	var audioType byte
-	var audioTarget byte
-	var user *User
-	var audioLength int
-
-	// Header byte
-	typeTarget, err := varint.ReadByte(reader)
-	if err != nil {
-		return err
-	}
-	audioType = (typeTarget >> 5) & 0x7
-	audioTarget = typeTarget & 0x1F
-	// Opus only
-	if audioType != 4 {
+func (c *Client) handleUDPTunnel(buffer []byte) error {
+	if len(buffer) < 1 {
 		return errInvalidProtobuf
 	}
-	bytesRead++
+	audioType := (buffer[0] >> 5) & 0x7
+	audioTarget := buffer[0] & 0x1F
+
+	// Opus only
+	// TODO: add handling for other packet types
+	if audioType != audioCodecIDOpus {
+		return errUnsupportedAudio
+	}
 
 	// Session
-	session, n, err := varint.ReadFrom(reader)
-	if err != nil {
-		return err
+	session, n := varint.Decode(buffer)
+	if n <= 0 {
+		return errInvalidProtobuf
 	}
-	user = c.users[uint(session)]
+	buff := buffer[n:]
+	user := c.Users[uint32(session)]
 	if user == nil {
 		return errInvalidProtobuf
 	}
-	bytesRead += n
+	decoder := user.decoder
+	if decoder == nil {
+		// TODO: decoder pool
+		// TODO: de-reference after stream is done
+		codec := c.audioCodec
+		if codec == nil {
+			return errNoCodec
+		}
+		decoder = codec.NewDecoder()
+		user.decoder = decoder
+	}
 
 	// Sequence
-	sequence, n, err := varint.ReadFrom(reader)
-	if err != nil {
-		return err
-	}
-	bytesRead += n
-
-	// Length
-	length, n, err := varint.ReadFrom(reader)
-	if err != nil {
-		return err
-	}
-	// Opus audio packets set the 13th bit in the size field as the terminator.
-	audioLength = int(length) &^ 0x2000
-	if audioLength > reader.Len() {
+	// TODO: use in jitter buffer
+	_, n = varint.Decode(buff)
+	if n <= 0 {
 		return errInvalidProtobuf
 	}
-	bytesRead += n
+	buff = buff[n:]
 
-	opus := buffer[bytesRead : bytesRead+int64(audioLength)]
-	pcm, err := user.decoder.Decode(opus, AudioMaximumFrameSize, false)
+	// Length
+	length, n := varint.Decode(buff)
+	if n <= 0 {
+		return errInvalidProtobuf
+	}
+	buff = buff[n:]
+	// Opus audio packets set the 13th bit in the size field as the terminator.
+	audioLength := int(length) &^ 0x2000
+	if audioLength > len(buff) {
+		return errInvalidProtobuf
+	}
+
+	pcm, err := decoder.Decode(buff[:audioLength], AudioMaximumFrameSize)
 	if err != nil {
 		return err
 	}
-	event := AudioPacketEvent{
+
+	event := AudioPacket{
 		Client: c,
-		AudioPacket: AudioPacket{
-			Sender:   user,
-			Target:   int(audioTarget),
-			Sequence: int(sequence),
-			Pcm:      pcm,
+		Sender: user,
+		Target: &VoiceTarget{
+			ID: uint32(audioTarget),
 		},
+		AudioBuffer: AudioBuffer(pcm),
 	}
-	c.audioListeners.OnAudioPacket(&event)
+
+	if len(buff)-audioLength == 3*4 {
+		// the packet has positional audio data; 3x float32
+		buff = buff[audioLength:]
+
+		event.X = math.Float32frombits(binary.LittleEndian.Uint32(buff))
+		event.Y = math.Float32frombits(binary.LittleEndian.Uint32(buff[4:]))
+		event.Z = math.Float32frombits(binary.LittleEndian.Uint32(buff[8:]))
+		event.HasPosition = true
+	}
+
+	c.volatileLock.Lock()
+	c.volatileWg.Wait()
+	for item := c.audioListeners.head; item != nil; item = item.next {
+		c.volatileLock.Unlock()
+		ch := item.streams[user]
+		if ch == nil {
+			ch = make(chan *AudioPacket)
+			item.streams[user] = ch
+			event := AudioStreamEvent{
+				Client: c,
+				User:   user,
+				C:      ch,
+			}
+			item.listener.OnAudioStream(&event)
+		}
+		ch <- &event
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+	}
+	c.volatileLock.Unlock()
+
 	return nil
 }
 
-func handleAuthenticate(c *Client, buffer []byte) error {
+func (c *Client) handleAuthenticate(buffer []byte) error {
 	return errUnimplementedHandler
 }
 
-func handlePing(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
+func (c *Client) handlePing(buffer []byte) error {
+	var packet MumbleProto.Ping
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+	atomic.AddUint32(&c.pingStats.TCPPackets, 1)
+	return nil
 }
 
-func handleReject(c *Client, buffer []byte) error {
+func (c *Client) handleReject(buffer []byte) error {
 	var packet MumbleProto.Reject
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -171,11 +208,11 @@ func handleReject(c *Client, buffer []byte) error {
 	if packet.Reason != nil {
 		c.disconnectEvent.String = *packet.Reason
 	}
-	c.connection.Close()
+	c.Conn.Close()
 	return nil
 }
 
-func handleServerSync(c *Client, buffer []byte) error {
+func (c *Client) handleServerSync(buffer []byte) error {
 	var packet MumbleProto.ServerSync
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -185,21 +222,29 @@ func handleServerSync(c *Client, buffer []byte) error {
 	}
 
 	if packet.Session != nil {
-		c.self = c.users.BySession(uint(*packet.Session))
+		{
+			c.volatileLock.Lock()
+			c.volatileWg.Wait()
+
+			c.Self = c.Users[*packet.Session]
+
+			c.volatileLock.Unlock()
+		}
 	}
 	if packet.WelcomeText != nil {
-		event.WelcomeMessage = *packet.WelcomeText
+		event.WelcomeMessage = packet.WelcomeText
 	}
 	if packet.MaxBandwidth != nil {
-		event.MaximumBitrate = int(*packet.MaxBandwidth)
+		val := int(*packet.MaxBandwidth)
+		event.MaximumBitrate = &val
 	}
-	c.state = StateSynced
+	atomic.StoreUint32(&c.state, uint32(StateSynced))
 
 	c.listeners.OnConnect(&event)
 	return nil
 }
 
-func handleChannelRemove(c *Client, buffer []byte) error {
+func (c *Client) handleChannelRemove(buffer []byte) error {
 	var packet MumbleProto.ChannelRemove
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -208,20 +253,32 @@ func handleChannelRemove(c *Client, buffer []byte) error {
 	if packet.ChannelId == nil {
 		return errIncompleteProtobuf
 	}
+
 	var channel *Channel
 	{
-		channelID := uint(*packet.ChannelId)
-		channel = c.channels.ByID(channelID)
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		channelID := *packet.ChannelId
+		channel = c.Channels[channelID]
 		if channel == nil {
+			c.volatileLock.Unlock()
 			return errInvalidProtobuf
 		}
-		c.channels.delete(channelID)
-		if parent := channel.parent; parent != nil {
-			channel.parent.children.delete(uint(channel.id))
+		channel.client = nil
+		delete(c.Channels, channelID)
+		delete(c.permissions, channelID)
+		if parent := channel.Parent; parent != nil {
+			delete(parent.Children, channel.ID)
 		}
+		for _, link := range channel.Links {
+			delete(link.Links, channelID)
+		}
+
+		c.volatileLock.Unlock()
 	}
 
-	if c.state == StateSynced {
+	if c.State() == StateSynced {
 		event := ChannelChangeEvent{
 			Client:  c,
 			Type:    ChannelChangeRemoved,
@@ -232,7 +289,7 @@ func handleChannelRemove(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handleChannelState(c *Client, buffer []byte) error {
+func (c *Client) handleChannelState(buffer []byte) error {
 	var packet MumbleProto.ChannelState
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -244,65 +301,98 @@ func handleChannelState(c *Client, buffer []byte) error {
 	event := ChannelChangeEvent{
 		Client: c,
 	}
-	var channel *Channel
-	channelID := uint(*packet.ChannelId)
-	if !c.channels.Exists(channelID) {
-		channel = c.channels.create(channelID)
-		channel.client = c
 
-		event.Type |= ChannelChangeCreated
-	} else {
-		channel = c.channels.ByID(channelID)
-	}
-	event.Channel = channel
-	if packet.Parent != nil {
-		if channel.parent != nil {
-			channel.parent.children.delete(channelID)
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		channelID := *packet.ChannelId
+		channel := c.Channels[channelID]
+		if channel == nil {
+			channel = c.Channels.create(channelID)
+			channel.client = c
+
+			event.Type |= ChannelChangeCreated
 		}
-		newParent := c.channels.ByID(uint(*packet.Parent))
-		if newParent != channel.parent {
-			event.Type |= ChannelChangeMoved
+		event.Channel = channel
+		if packet.Parent != nil {
+			if channel.Parent != nil {
+				delete(channel.Parent.Children, channelID)
+			}
+			newParent := c.Channels[*packet.Parent]
+			if newParent != channel.Parent {
+				event.Type |= ChannelChangeMoved
+			}
+			channel.Parent = newParent
+			if channel.Parent != nil {
+				channel.Parent.Children[channel.ID] = channel
+			}
 		}
-		channel.parent = newParent
-		if channel.parent != nil {
-			channel.parent.children[uint(channel.id)] = channel
+		if packet.Name != nil {
+			if *packet.Name != channel.Name {
+				event.Type |= ChannelChangeName
+			}
+			channel.Name = *packet.Name
 		}
-	}
-	if packet.Name != nil {
-		if *packet.Name != channel.name {
-			event.Type |= ChannelChangeName
+		if packet.Links != nil {
+			channel.Links = make(Channels)
+			event.Type |= ChannelChangeLinks
+			for _, channelID := range packet.Links {
+				if c := c.Channels[channelID]; c != nil {
+					channel.Links[channelID] = c
+				}
+			}
 		}
-		channel.name = *packet.Name
-	}
-	if packet.Description != nil {
-		if *packet.Description != channel.description {
+		for _, channelID := range packet.LinksAdd {
+			if c := c.Channels[channelID]; c != nil {
+				event.Type |= ChannelChangeLinks
+				channel.Links[channelID] = c
+				c.Links[channel.ID] = channel
+			}
+		}
+		for _, channelID := range packet.LinksRemove {
+			if c := c.Channels[channelID]; c != nil {
+				event.Type |= ChannelChangeLinks
+				delete(channel.Links, channelID)
+				delete(c.Links, channel.ID)
+			}
+		}
+		if packet.Description != nil {
+			if *packet.Description != channel.Description {
+				event.Type |= ChannelChangeDescription
+			}
+			channel.Description = *packet.Description
+			channel.DescriptionHash = nil
+		}
+		if packet.Temporary != nil {
+			channel.Temporary = *packet.Temporary
+		}
+		if packet.Position != nil {
+			if *packet.Position != channel.Position {
+				event.Type |= ChannelChangePosition
+			}
+			channel.Position = *packet.Position
+		}
+		if packet.DescriptionHash != nil {
 			event.Type |= ChannelChangeDescription
+			channel.DescriptionHash = packet.DescriptionHash
+			channel.Description = ""
 		}
-		channel.description = *packet.Description
-		channel.descriptionHash = nil
-	}
-	if packet.Temporary != nil {
-		channel.temporary = *packet.Temporary
-	}
-	if packet.Position != nil {
-		if *packet.Position != channel.position {
-			event.Type |= ChannelChangePosition
+		if packet.MaxUsers != nil {
+			event.Type |= ChannelChangeMaxUsers
+			channel.MaxUsers = *packet.MaxUsers
 		}
-		channel.position = *packet.Position
-	}
-	if packet.DescriptionHash != nil {
-		event.Type |= ChannelChangeDescription
-		channel.descriptionHash = packet.DescriptionHash
-		channel.description = ""
+
+		c.volatileLock.Unlock()
 	}
 
-	if c.state == StateSynced {
+	if c.State() == StateSynced {
 		c.listeners.OnChannelChange(&event)
 	}
 	return nil
 }
 
-func handleUserRemove(c *Client, buffer []byte) error {
+func (c *Client) handleUserRemove(buffer []byte) error {
 	var packet MumbleProto.UserRemove
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -315,38 +405,54 @@ func handleUserRemove(c *Client, buffer []byte) error {
 		Client: c,
 		Type:   UserChangeDisconnected,
 	}
+
 	{
-		session := uint(*packet.Session)
-		event.User = c.users.BySession(session)
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		session := *packet.Session
+		event.User = c.Users[session]
 		if event.User == nil {
+			c.volatileLock.Unlock()
 			return errInvalidProtobuf
 		}
-		if event.User.channel != nil {
-			event.User.channel.users.delete(session)
+		event.User.client = nil
+		if event.User.Channel != nil {
+			delete(event.User.Channel.Users, session)
 		}
-		c.users.delete(session)
-	}
-	if packet.Actor != nil {
-		event.Actor = c.users.BySession(uint(*packet.Actor))
-		if event.Actor == nil {
-			return errInvalidProtobuf
+		delete(c.Users, session)
+
+		if packet.Actor != nil {
+			event.Actor = c.Users[*packet.Actor]
+			if event.Actor == nil {
+				return errInvalidProtobuf
+			}
+			event.Type |= UserChangeKicked
 		}
-		event.Type |= UserChangeKicked
-	}
-	if packet.Reason != nil {
-		event.String = *packet.Reason
-	}
-	if packet.Ban != nil && *packet.Ban {
-		event.Type |= UserChangeBanned
+		if packet.Reason != nil {
+			event.String = *packet.Reason
+		}
+		if packet.Ban != nil && *packet.Ban {
+			event.Type |= UserChangeBanned
+		}
+		if event.User == c.Self {
+			if packet.Ban != nil && *packet.Ban {
+				c.disconnectEvent.Type = DisconnectBanned
+			} else {
+				c.disconnectEvent.Type = DisconnectKicked
+			}
+		}
+
+		c.volatileLock.Unlock()
 	}
 
-	if c.state == StateSynced {
+	if c.State() == StateSynced {
 		c.listeners.OnUserChange(&event)
 	}
 	return nil
 }
 
-func handleUserState(c *Client, buffer []byte) error {
+func (c *Client) handleUserState(buffer []byte) error {
 	var packet MumbleProto.UserState
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -360,142 +466,147 @@ func handleUserState(c *Client, buffer []byte) error {
 	}
 	var user, actor *User
 	{
-		session := uint(*packet.Session)
-		if !c.users.Exists(session) {
-			user = c.users.create(session)
-			user.channel = c.channels.ByID(0)
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		session := *packet.Session
+		user = c.Users[session]
+		if user == nil {
+			user = c.Users.create(session)
+			user.Channel = c.Channels[0]
 			user.client = c
 
 			event.Type |= UserChangeConnected
 
-			decoder, _ := gopus.NewDecoder(AudioSampleRate, 1)
-			user.decoder = decoder
-
-			if user.channel == nil {
+			if user.Channel == nil {
+				c.volatileLock.Unlock()
 				return errInvalidProtobuf
 			}
 			event.Type |= UserChangeChannel
-			user.channel.users[session] = user
-		} else {
-			user = c.users.BySession(session)
+			user.Channel.Users[session] = user
 		}
-	}
-	event.User = user
-	if packet.Actor != nil {
-		actor = c.users.BySession(uint(*packet.Actor))
-		if actor == nil {
-			return errInvalidProtobuf
-		}
-		event.Actor = actor
-	}
-	if packet.Name != nil {
-		if *packet.Name != user.name {
-			event.Type |= UserChangeName
-		}
-		user.name = *packet.Name
-	}
-	if packet.UserId != nil {
-		if *packet.UserId != user.userID && !event.Type.Has(UserChangeConnected) {
-			if *packet.UserId != math.MaxUint32 {
-				event.Type |= UserChangeRegistered
-				user.userID = *packet.UserId
-			} else {
-				event.Type |= UserChangeUnregistered
-				user.userID = 0
+
+		event.User = user
+		if packet.Actor != nil {
+			actor = c.Users[*packet.Actor]
+			if actor == nil {
+				c.volatileLock.Unlock()
+				return errInvalidProtobuf
 			}
-		} else {
-			user.userID = *packet.UserId
+			event.Actor = actor
 		}
-	}
-	if packet.ChannelId != nil {
-		if user.channel != nil {
-			user.channel.users.delete(user.Session())
+		if packet.Name != nil {
+			if *packet.Name != user.Name {
+				event.Type |= UserChangeName
+			}
+			user.Name = *packet.Name
 		}
-		newChannel := c.channels.ByID(uint(*packet.ChannelId))
-		if newChannel == nil {
-			return errInvalidProtobuf
+		if packet.UserId != nil {
+			if *packet.UserId != user.UserID && !event.Type.Has(UserChangeConnected) {
+				if *packet.UserId != math.MaxUint32 {
+					event.Type |= UserChangeRegistered
+					user.UserID = *packet.UserId
+				} else {
+					event.Type |= UserChangeUnregistered
+					user.UserID = 0
+				}
+			} else {
+				user.UserID = *packet.UserId
+			}
 		}
-		if newChannel != user.channel {
-			event.Type |= UserChangeChannel
-			user.channel = newChannel
+		if packet.ChannelId != nil {
+			if user.Channel != nil {
+				delete(user.Channel.Users, user.Session)
+			}
+			newChannel := c.Channels[*packet.ChannelId]
+			if newChannel == nil {
+				c.volatileLock.Unlock()
+				return errInvalidProtobuf
+			}
+			if newChannel != user.Channel {
+				event.Type |= UserChangeChannel
+				user.Channel = newChannel
+			}
+			user.Channel.Users[user.Session] = user
 		}
-		user.channel.users[user.Session()] = user
-	}
-	if packet.Mute != nil {
-		if *packet.Mute != user.mute {
-			event.Type |= UserChangeAudio
+		if packet.Mute != nil {
+			if *packet.Mute != user.Muted {
+				event.Type |= UserChangeAudio
+			}
+			user.Muted = *packet.Mute
 		}
-		user.mute = *packet.Mute
-	}
-	if packet.Deaf != nil {
-		if *packet.Deaf != user.deaf {
-			event.Type |= UserChangeAudio
+		if packet.Deaf != nil {
+			if *packet.Deaf != user.Deafened {
+				event.Type |= UserChangeAudio
+			}
+			user.Deafened = *packet.Deaf
 		}
-		user.deaf = *packet.Deaf
-	}
-	if packet.Suppress != nil {
-		if *packet.Suppress != user.suppress {
-			event.Type |= UserChangeAudio
+		if packet.Suppress != nil {
+			if *packet.Suppress != user.Suppressed {
+				event.Type |= UserChangeAudio
+			}
+			user.Suppressed = *packet.Suppress
 		}
-		user.suppress = *packet.Suppress
-	}
-	if packet.SelfMute != nil {
-		if *packet.SelfMute != user.selfMute {
-			event.Type |= UserChangeAudio
+		if packet.SelfMute != nil {
+			if *packet.SelfMute != user.SelfMuted {
+				event.Type |= UserChangeAudio
+			}
+			user.SelfMuted = *packet.SelfMute
 		}
-		user.selfMute = *packet.SelfMute
-	}
-	if packet.SelfDeaf != nil {
-		if *packet.SelfDeaf != user.selfDeaf {
-			event.Type |= UserChangeAudio
+		if packet.SelfDeaf != nil {
+			if *packet.SelfDeaf != user.SelfDeafened {
+				event.Type |= UserChangeAudio
+			}
+			user.SelfDeafened = *packet.SelfDeaf
 		}
-		user.selfDeaf = *packet.SelfDeaf
-	}
-	if packet.Texture != nil {
-		event.Type |= UserChangeTexture
-		user.texture = packet.Texture
-		user.textureHash = nil
-	}
-	if packet.Comment != nil {
-		if *packet.Comment != user.comment {
+		if packet.Texture != nil {
+			event.Type |= UserChangeTexture
+			user.Texture = packet.Texture
+			user.TextureHash = nil
+		}
+		if packet.Comment != nil {
+			if *packet.Comment != user.Comment {
+				event.Type |= UserChangeComment
+			}
+			user.Comment = *packet.Comment
+			user.CommentHash = nil
+		}
+		if packet.Hash != nil {
+			user.Hash = *packet.Hash
+		}
+		if packet.CommentHash != nil {
 			event.Type |= UserChangeComment
+			user.CommentHash = packet.CommentHash
+			user.Comment = ""
 		}
-		user.comment = *packet.Comment
-		user.commentHash = nil
-	}
-	if packet.Hash != nil {
-		user.hash = *packet.Hash
-	}
-	if packet.CommentHash != nil {
-		event.Type |= UserChangeComment
-		user.commentHash = packet.CommentHash
-		user.comment = ""
-	}
-	if packet.TextureHash != nil {
-		event.Type |= UserChangeTexture
-		user.textureHash = packet.TextureHash
-		user.texture = nil
-	}
-	if packet.PrioritySpeaker != nil {
-		if *packet.PrioritySpeaker != user.prioritySpeaker {
-			event.Type |= UserChangePrioritySpeaker
+		if packet.TextureHash != nil {
+			event.Type |= UserChangeTexture
+			user.TextureHash = packet.TextureHash
+			user.Texture = nil
 		}
-		user.prioritySpeaker = *packet.PrioritySpeaker
-	}
-	if packet.Recording != nil {
-		if *packet.Recording != user.recording {
-			event.Type |= UserChangeRecording
+		if packet.PrioritySpeaker != nil {
+			if *packet.PrioritySpeaker != user.PrioritySpeaker {
+				event.Type |= UserChangePrioritySpeaker
+			}
+			user.PrioritySpeaker = *packet.PrioritySpeaker
 		}
-		user.recording = *packet.Recording
+		if packet.Recording != nil {
+			if *packet.Recording != user.Recording {
+				event.Type |= UserChangeRecording
+			}
+			user.Recording = *packet.Recording
+		}
+
+		c.volatileLock.Unlock()
 	}
 
-	if c.state == StateSynced {
+	if c.State() == StateSynced {
 		c.listeners.OnUserChange(&event)
 	}
 	return nil
 }
 
-func handleBanList(c *Client, buffer []byte) error {
+func (c *Client) handleBanList(buffer []byte) error {
 	var packet MumbleProto.BanList
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -508,29 +619,29 @@ func handleBanList(c *Client, buffer []byte) error {
 
 	for _, banPacket := range packet.Bans {
 		ban := &Ban{
-			address: net.IP(banPacket.Address),
+			Address: net.IP(banPacket.Address),
 		}
 		if banPacket.Mask != nil {
 			size := net.IPv4len * 8
-			if len(ban.address) == net.IPv6len {
+			if len(ban.Address) == net.IPv6len {
 				size = net.IPv6len * 8
 			}
-			ban.mask = net.CIDRMask(int(*banPacket.Mask), size)
+			ban.Mask = net.CIDRMask(int(*banPacket.Mask), size)
 		}
 		if banPacket.Name != nil {
-			ban.name = *banPacket.Name
+			ban.Name = *banPacket.Name
 		}
 		if banPacket.Hash != nil {
-			ban.hash = *banPacket.Hash
+			ban.Hash = *banPacket.Hash
 		}
 		if banPacket.Reason != nil {
-			ban.reason = *banPacket.Reason
+			ban.Reason = *banPacket.Reason
 		}
 		if banPacket.Start != nil {
-			ban.start, _ = time.Parse(time.RFC3339, *banPacket.Start)
+			ban.Start, _ = time.Parse(time.RFC3339, *banPacket.Start)
 		}
 		if banPacket.Duration != nil {
-			ban.duration = time.Duration(*banPacket.Duration) * time.Second
+			ban.Duration = time.Duration(*banPacket.Duration) * time.Second
 		}
 		event.BanList = append(event.BanList, ban)
 	}
@@ -539,7 +650,7 @@ func handleBanList(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handleTextMessage(c *Client, buffer []byte) error {
+func (c *Client) handleTextMessage(buffer []byte) error {
 	var packet MumbleProto.TextMessage
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -549,12 +660,12 @@ func handleTextMessage(c *Client, buffer []byte) error {
 		Client: c,
 	}
 	if packet.Actor != nil {
-		event.Sender = c.users.BySession(uint(*packet.Actor))
+		event.Sender = c.Users[*packet.Actor]
 	}
 	if packet.Session != nil {
 		event.Users = make([]*User, 0, len(packet.Session))
 		for _, session := range packet.Session {
-			if user := c.users.BySession(uint(session)); user != nil {
+			if user := c.Users[session]; user != nil {
 				event.Users = append(event.Users, user)
 			}
 		}
@@ -562,7 +673,7 @@ func handleTextMessage(c *Client, buffer []byte) error {
 	if packet.ChannelId != nil {
 		event.Channels = make([]*Channel, 0, len(packet.ChannelId))
 		for _, id := range packet.ChannelId {
-			if channel := c.channels.ByID(uint(id)); channel != nil {
+			if channel := c.Channels[id]; channel != nil {
 				event.Channels = append(event.Channels, channel)
 			}
 		}
@@ -570,7 +681,7 @@ func handleTextMessage(c *Client, buffer []byte) error {
 	if packet.TreeId != nil {
 		event.Trees = make([]*Channel, 0, len(packet.TreeId))
 		for _, id := range packet.TreeId {
-			if channel := c.channels.ByID(uint(id)); channel != nil {
+			if channel := c.Channels[id]; channel != nil {
 				event.Trees = append(event.Trees, channel)
 			}
 		}
@@ -583,7 +694,7 @@ func handleTextMessage(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handlePermissionDenied(c *Client, buffer []byte) error {
+func (c *Client) handlePermissionDenied(buffer []byte) error {
 	var packet MumbleProto.PermissionDenied
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -604,13 +715,13 @@ func handlePermissionDenied(c *Client, buffer []byte) error {
 		event.String = *packet.Name
 	}
 	if packet.Session != nil {
-		event.User = c.users.BySession(uint(*packet.Session))
+		event.User = c.Users[*packet.Session]
 		if event.User == nil {
 			return errInvalidProtobuf
 		}
 	}
 	if packet.ChannelId != nil {
-		event.Channel = c.channels.ByID(uint(*packet.ChannelId))
+		event.Channel = c.Channels[*packet.ChannelId]
 		if event.Channel == nil {
 			return errInvalidProtobuf
 		}
@@ -623,42 +734,142 @@ func handlePermissionDenied(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handleAcl(c *Client, buffer []byte) error {
+func (c *Client) handleACL(buffer []byte) error {
 	var packet MumbleProto.ACL
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
 	}
 
-	event := AclEvent{
-		Client: c,
-		Acl:    &Acl{},
+	acl := &ACL{
+		Inherits: packet.GetInheritAcls(),
 	}
-	if packet.ChannelId != nil {
-		event.Acl.channel = c.channels.ByID(uint(*packet.ChannelId))
+	if packet.ChannelId == nil {
+		return errInvalidProtobuf
+	}
+	acl.Channel = c.Channels[*packet.ChannelId]
+	if acl.Channel == nil {
+		return errInvalidProtobuf
 	}
 
 	if packet.Groups != nil {
-		event.Acl.groups = make([]*AclGroup, 0, len(packet.Groups))
+		acl.Groups = make([]*ACLGroup, 0, len(packet.Groups))
 		for _, group := range packet.Groups {
-			event.Acl.groups = append(event.Acl.groups, &AclGroup{
-				name: *group.Name,
-			})
+			aclGroup := &ACLGroup{
+				Name:         *group.Name,
+				Inherited:    group.GetInherited(),
+				InheritUsers: group.GetInherit(),
+				Inheritable:  group.GetInheritable(),
+			}
+			if group.Add != nil {
+				aclGroup.UsersAdd = make(map[uint32]*ACLUser)
+				for _, userID := range group.Add {
+					aclGroup.UsersAdd[userID] = &ACLUser{
+						UserID: userID,
+					}
+				}
+			}
+			if group.Remove != nil {
+				aclGroup.UsersRemove = make(map[uint32]*ACLUser)
+				for _, userID := range group.Remove {
+					aclGroup.UsersRemove[userID] = &ACLUser{
+						UserID: userID,
+					}
+				}
+			}
+			if group.InheritedMembers != nil {
+				aclGroup.UsersInherited = make(map[uint32]*ACLUser)
+				for _, userID := range group.InheritedMembers {
+					aclGroup.UsersInherited[userID] = &ACLUser{
+						UserID: userID,
+					}
+				}
+			}
+			acl.Groups = append(acl.Groups, aclGroup)
 		}
 	}
-
-	c.listeners.OnAcl(&event)
+	if packet.Acls != nil {
+		acl.Rules = make([]*ACLRule, 0, len(packet.Acls))
+		for _, rule := range packet.Acls {
+			aclRule := &ACLRule{
+				AppliesCurrent:  rule.GetApplyHere(),
+				AppliesChildren: rule.GetApplySubs(),
+				Inherited:       rule.GetInherited(),
+				Granted:         Permission(rule.GetGrant()),
+				Denied:          Permission(rule.GetDeny()),
+			}
+			if rule.UserId != nil {
+				aclRule.User = &ACLUser{
+					UserID: *rule.UserId,
+				}
+			} else if rule.Group != nil {
+				var group *ACLGroup
+				for _, g := range acl.Groups {
+					if g.Name == *rule.Group {
+						group = g
+						break
+					}
+				}
+				if group == nil {
+					group = &ACLGroup{
+						Name: *rule.Group,
+					}
+				}
+				aclRule.Group = group
+			}
+			acl.Rules = append(acl.Rules, aclRule)
+		}
+	}
+	c.tmpACL = acl
 	return nil
 }
 
-func handleQueryUsers(c *Client, buffer []byte) error {
+func (c *Client) handleQueryUsers(buffer []byte) error {
+	var packet MumbleProto.QueryUsers
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+
+	acl := c.tmpACL
+	if acl == nil {
+		return errIncompleteProtobuf
+	}
+	c.tmpACL = nil
+
+	userMap := make(map[uint32]string)
+	for i := 0; i < len(packet.Ids) && i < len(packet.Names); i++ {
+		userMap[packet.Ids[i]] = packet.Names[i]
+	}
+
+	for _, group := range acl.Groups {
+		for _, user := range group.UsersAdd {
+			user.Name = userMap[user.UserID]
+		}
+		for _, user := range group.UsersRemove {
+			user.Name = userMap[user.UserID]
+		}
+		for _, user := range group.UsersInherited {
+			user.Name = userMap[user.UserID]
+		}
+	}
+	for _, rule := range acl.Rules {
+		if rule.User != nil {
+			rule.User.Name = userMap[rule.User.UserID]
+		}
+	}
+
+	event := ACLEvent{
+		Client: c,
+		ACL:    acl,
+	}
+	c.listeners.OnACL(&event)
+	return nil
+}
+
+func (c *Client) handleCryptSetup(buffer []byte) error {
 	return errUnimplementedHandler
 }
 
-func handleCryptSetup(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
-}
-
-func handleContextActionModify(c *Client, buffer []byte) error {
+func (c *Client) handleContextActionModify(buffer []byte) error {
 	var packet MumbleProto.ContextActionModify
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -672,41 +883,51 @@ func handleContextActionModify(c *Client, buffer []byte) error {
 		Client: c,
 	}
 
-	switch *packet.Operation {
-	case MumbleProto.ContextActionModify_Add:
-		if c.contextActions.Exists(*packet.Action) {
-			return nil
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		switch *packet.Operation {
+		case MumbleProto.ContextActionModify_Add:
+			if ca := c.ContextActions[*packet.Action]; ca != nil {
+				c.volatileLock.Unlock()
+				return nil
+			}
+			event.Type = ContextActionAdd
+			contextAction := c.ContextActions.create(*packet.Action)
+			if packet.Text != nil {
+				contextAction.Label = *packet.Text
+			}
+			if packet.Context != nil {
+				contextAction.Type = ContextActionType(*packet.Context)
+			}
+			event.ContextAction = contextAction
+		case MumbleProto.ContextActionModify_Remove:
+			contextAction := c.ContextActions[*packet.Action]
+			if contextAction == nil {
+				c.volatileLock.Unlock()
+				return nil
+			}
+			event.Type = ContextActionRemove
+			delete(c.ContextActions, *packet.Action)
+			event.ContextAction = contextAction
+		default:
+			c.volatileLock.Unlock()
+			return errInvalidProtobuf
 		}
-		event.Type = ContextActionAdd
-		contextAction := c.contextActions.create(*packet.Action)
-		if packet.Text != nil {
-			contextAction.label = *packet.Text
-		}
-		if packet.Context != nil {
-			contextAction.contextType = ContextActionType(*packet.Context)
-		}
-		event.ContextAction = contextAction
-	case MumbleProto.ContextActionModify_Remove:
-		if !c.contextActions.Exists(*packet.Action) {
-			return nil
-		}
-		event.Type = ContextActionRemove
-		contextAction := c.contextActions[*packet.Action]
-		c.contextActions.delete(*packet.Action)
-		event.ContextAction = contextAction
-	default:
-		return errInvalidProtobuf
+
+		c.volatileLock.Unlock()
 	}
 
 	c.listeners.OnContextActionChange(&event)
 	return nil
 }
 
-func handleContextAction(c *Client, buffer []byte) error {
+func (c *Client) handleContextAction(buffer []byte) error {
 	return errUnimplementedHandler
 }
 
-func handleUserList(c *Client, buffer []byte) error {
+func (c *Client) handleUserList(buffer []byte) error {
 	var packet MumbleProto.UserList
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -719,10 +940,18 @@ func handleUserList(c *Client, buffer []byte) error {
 
 	for _, user := range packet.Users {
 		registeredUser := &RegisteredUser{
-			userID: *user.UserId,
+			UserID: *user.UserId,
 		}
 		if user.Name != nil {
-			registeredUser.name = *user.Name
+			registeredUser.Name = *user.Name
+		}
+		if user.LastSeen != nil {
+			registeredUser.LastSeen, _ = time.ParseInLocation(time.RFC3339, *user.LastSeen, nil)
+		}
+		if user.LastChannel != nil {
+			if lastChannel := c.Channels[*user.LastChannel]; lastChannel != nil {
+				registeredUser.LastChannel = lastChannel
+			}
 		}
 		event.UserList = append(event.UserList, registeredUser)
 	}
@@ -731,19 +960,102 @@ func handleUserList(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handleVoiceTarget(c *Client, buffer []byte) error {
+func (c *Client) handleVoiceTarget(buffer []byte) error {
 	return errUnimplementedHandler
 }
 
-func handlePermissionQuery(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
+func (c *Client) handlePermissionQuery(buffer []byte) error {
+	var packet MumbleProto.PermissionQuery
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+
+	var singleChannel *Channel
+	if packet.ChannelId != nil && packet.Permissions != nil {
+		singleChannel = c.Channels[*packet.ChannelId]
+		if singleChannel == nil {
+			return errInvalidProtobuf
+		}
+	}
+
+	var changedChannels []*Channel
+
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
+
+		if packet.GetFlush() {
+			oldPermissions := c.permissions
+			c.permissions = make(map[uint32]*Permission)
+			changedChannels = make([]*Channel, 0, len(oldPermissions))
+			for channelID := range oldPermissions {
+				changedChannels = append(changedChannels, c.Channels[channelID])
+			}
+		}
+
+		if singleChannel != nil {
+			p := Permission(*packet.Permissions)
+			c.permissions[singleChannel.ID] = &p
+			changedChannels = append(changedChannels, singleChannel)
+		}
+
+		c.volatileLock.Unlock()
+	}
+
+	for _, channel := range changedChannels {
+		event := ChannelChangeEvent{
+			Client:  c,
+			Type:    ChannelChangePermission,
+			Channel: channel,
+		}
+		c.listeners.OnChannelChange(&event)
+	}
+
+	return nil
 }
 
-func handleCodecVersion(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
+func (c *Client) handleCodecVersion(buffer []byte) error {
+	var packet MumbleProto.CodecVersion
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+	event := ServerConfigEvent{
+		Client: c,
+	}
+	event.CodecAlpha = packet.Alpha
+	event.CodecBeta = packet.Beta
+	{
+		val := packet.GetPreferAlpha()
+		event.CodecPreferAlpha = &val
+	}
+	{
+		val := packet.GetOpus()
+		event.CodecOpus = &val
+	}
+
+	var codec AudioCodec
+	switch {
+	case *event.CodecOpus:
+		codec = getAudioCodec(audioCodecIDOpus)
+	}
+	if codec != nil {
+		c.audioCodec = codec
+
+		{
+			c.volatileLock.Lock()
+			c.volatileWg.Wait()
+
+			c.AudioEncoder = codec.NewEncoder()
+
+			c.volatileLock.Unlock()
+		}
+	}
+
+	c.listeners.OnServerConfig(&event)
+	return nil
 }
 
-func handleUserStats(c *Client, buffer []byte) error {
+func (c *Client) handleUserStats(buffer []byte) error {
 	var packet MumbleProto.UserStats
 	if err := proto.Unmarshal(buffer, &packet); err != nil {
 		return err
@@ -752,22 +1064,56 @@ func handleUserStats(c *Client, buffer []byte) error {
 	if packet.Session == nil {
 		return errIncompleteProtobuf
 	}
-	user := c.users.BySession(uint(*packet.Session))
+	user := c.Users[*packet.Session]
 	if user == nil {
 		return errInvalidProtobuf
 	}
 
-	if packet.Version != nil {
-		user.stats.version = parseVersion(packet.Version)
-	}
-	if packet.Onlinesecs != nil {
-		user.stats.connected = time.Now().Add(time.Duration(*packet.Onlinesecs) * -time.Second)
-	}
-	if packet.Idlesecs != nil {
-		user.stats.idle = time.Duration(*packet.Idlesecs) * time.Second
-	}
+	{
+		c.volatileLock.Lock()
+		c.volatileWg.Wait()
 
-	user.statsFetched = true
+		if user.Stats == nil {
+			user.Stats = &UserStats{}
+		}
+		*user.Stats = UserStats{
+			User: user,
+		}
+		stats := user.Stats
+
+		if packet.Version != nil {
+			stats.Version = parseVersion(packet.Version)
+		}
+		if packet.Onlinesecs != nil {
+			stats.Connected = time.Now().Add(time.Duration(*packet.Onlinesecs) * -time.Second)
+		}
+		if packet.Idlesecs != nil {
+			stats.Idle = time.Duration(*packet.Idlesecs) * time.Second
+		}
+		if packet.Bandwidth != nil {
+			stats.Bandwidth = int(*packet.Bandwidth)
+		}
+		if packet.Address != nil {
+			stats.IP = net.IP(packet.Address)
+		}
+		if packet.Certificates != nil {
+			stats.Certificates = make([]*x509.Certificate, 0, len(packet.Certificates))
+			for _, data := range packet.Certificates {
+				if data != nil {
+					if cert, err := x509.ParseCertificate(data); err == nil {
+						stats.Certificates = append(stats.Certificates, cert)
+					}
+				}
+			}
+		}
+		stats.StrongCertificate = packet.GetStrongCertificate()
+		stats.CELTVersions = packet.GetCeltVersions()
+		if packet.Opus != nil {
+			stats.Opus = *packet.Opus
+		}
+
+		c.volatileLock.Unlock()
+	}
 
 	event := UserChangeEvent{
 		Client: c,
@@ -779,14 +1125,63 @@ func handleUserStats(c *Client, buffer []byte) error {
 	return nil
 }
 
-func handleRequestBlob(c *Client, buffer []byte) error {
+func (c *Client) handleRequestBlob(buffer []byte) error {
 	return errUnimplementedHandler
 }
 
-func handleServerConfig(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
+func (c *Client) handleServerConfig(buffer []byte) error {
+	var packet MumbleProto.ServerConfig
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+	event := ServerConfigEvent{
+		Client: c,
+	}
+	if packet.MaxBandwidth != nil {
+		val := int(*packet.MaxBandwidth)
+		event.MaximumBitrate = &val
+	}
+	if packet.WelcomeText != nil {
+		event.WelcomeMessage = packet.WelcomeText
+	}
+	if packet.AllowHtml != nil {
+		event.AllowHTML = packet.AllowHtml
+	}
+	if packet.MessageLength != nil {
+		val := int(*packet.MessageLength)
+		event.MaximumMessageLength = &val
+	}
+	if packet.ImageMessageLength != nil {
+		val := int(*packet.ImageMessageLength)
+		event.MaximumImageMessageLength = &val
+	}
+	if packet.MaxUsers != nil {
+		val := int(*packet.MaxUsers)
+		event.MaximumUsers = &val
+	}
+	c.listeners.OnServerConfig(&event)
+	return nil
 }
 
-func handleSuggestConfig(c *Client, buffer []byte) error {
-	return errUnimplementedHandler
+func (c *Client) handleSuggestConfig(buffer []byte) error {
+	var packet MumbleProto.SuggestConfig
+	if err := proto.Unmarshal(buffer, &packet); err != nil {
+		return err
+	}
+	event := ServerConfigEvent{
+		Client: c,
+	}
+	if packet.Version != nil {
+		event.SuggestVersion = &Version{
+			Version: packet.GetVersion(),
+		}
+	}
+	if packet.Positional != nil {
+		event.SuggestPositional = packet.Positional
+	}
+	if packet.PushToTalk != nil {
+		event.SuggestPushToTalk = packet.PushToTalk
+	}
+	c.listeners.OnServerConfig(&event)
+	return nil
 }

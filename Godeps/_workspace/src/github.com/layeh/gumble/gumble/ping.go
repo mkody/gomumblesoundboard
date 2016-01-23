@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -12,50 +13,30 @@ import (
 // PingResponse contains information about a server that responded to a UDP
 // ping packet.
 type PingResponse struct {
-	address        *net.UDPAddr
-	ping           time.Duration
-	version        Version
-	connectedUsers int
-	maximumUsers   int
-	maximumBitrate int
+	// The address of the pinged server.
+	Address *net.UDPAddr
+	// The round-trip time from the client to the server.
+	Ping time.Duration
+	// The server's version. Only the Version field and SemanticVersion method of
+	// the value will be valid.
+	Version Version
+	// The number users currently connected to the server.
+	ConnectedUsers int
+	// The maximum number of users that can connect to the server.
+	MaximumUsers int
+	// The maximum audio bitrate per user for the server.
+	MaximumBitrate int
 }
 
-// Address returns the the address of the pinged server.
-func (pr *PingResponse) Address() *net.UDPAddr {
-	return pr.address
-}
-
-// Ping returns the round-trip time from the client to the server.
-func (pr *PingResponse) Ping() time.Duration {
-	return pr.ping
-}
-
-// Version returns the server's version. Only the .Version() and
-// .SemanticVersion() methods of the returned value will return valid values.
-func (pr *PingResponse) Version() Version {
-	return pr.version
-}
-
-// ConnectedUsers returns the number users currently connected to the server.
-func (pr *PingResponse) ConnectedUsers() int {
-	return pr.connectedUsers
-}
-
-// MaximumUsers returns the maximum number of users that can connect to the
-// server.
-func (pr *PingResponse) MaximumUsers() int {
-	return pr.maximumUsers
-}
-
-// MaximumBitrate returns the maximum audio bitrate per user for the server.
-func (pr *PingResponse) MaximumBitrate() int {
-	return pr.maximumBitrate
-}
-
-// Ping sends a UDP ping packet to the given server. Returns a PingResponse and
-// nil on success. The function will return nil and an error if a valid
-// response is not received after the given timeout.
-func Ping(address string, timeout time.Duration) (*PingResponse, error) {
+// Ping sends a UDP ping packet to the given server. If interval is positive,
+// the packet is retransmitted at every interval.
+//
+// Returns a PingResponse and nil on success. The function will return nil and
+// an error if a valid response is not received after the given timeout.
+func Ping(address string, interval, timeout time.Duration) (*PingResponse, error) {
+	if timeout < 0 {
+		return nil, errors.New("gumble: timeout must be positive")
+	}
 	addr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, err
@@ -64,6 +45,7 @@ func Ping(address string, timeout time.Duration) (*PingResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
 	var packet [12]byte
 	if _, err := rand.Read(packet[4:]); err != nil {
@@ -72,6 +54,23 @@ func Ping(address string, timeout time.Duration) (*PingResponse, error) {
 	start := time.Now()
 	if _, err := conn.Write(packet[:]); err != nil {
 		return nil, err
+	}
+
+	if interval > 0 {
+		end := make(chan struct{})
+		defer close(end)
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					conn.Write(packet[:])
+				case <-end:
+					return
+				}
+			}
+		}()
 	}
 
 	conn.SetReadDeadline(time.Now().Add(timeout))
@@ -85,14 +84,14 @@ func Ping(address string, timeout time.Duration) (*PingResponse, error) {
 		}
 
 		return &PingResponse{
-			address: addr,
-			ping:    time.Since(start),
-			version: Version{
-				version: binary.BigEndian.Uint32(incoming[0:]),
+			Address: addr,
+			Ping:    time.Since(start),
+			Version: Version{
+				Version: binary.BigEndian.Uint32(incoming[0:]),
 			},
-			connectedUsers: int(binary.BigEndian.Uint32(incoming[12:])),
-			maximumUsers:   int(binary.BigEndian.Uint32(incoming[16:])),
-			maximumBitrate: int(binary.BigEndian.Uint32(incoming[20:])),
+			ConnectedUsers: int(binary.BigEndian.Uint32(incoming[12:])),
+			MaximumUsers:   int(binary.BigEndian.Uint32(incoming[16:])),
+			MaximumBitrate: int(binary.BigEndian.Uint32(incoming[20:])),
 		}, nil
 	}
 }

@@ -1,36 +1,50 @@
 {
-	"ImportPath": "github.com/robbi5/gomumblesoundboard",
-	"GoVersion": "go1.3.3",
+	"ImportPath": ".",
+	"GoVersion": "go1.3",
+	"Packages": [
+		"github.com/codegangsta/inject",
+		"github.com/go-martini/martini",
+		"github.com/layeh/gumble/gumbleffmpeg",
+		"github.com/layeh/gumble/gumbleutil",
+		"github.com/golang/protobuf/proto",
+		"github.com/layeh/gopus",
+		"github.com/layeh/gumble/gumble",
+		"github.com/layeh/gumble/opus"
+	],
 	"Deps": [
 		{
 			"ImportPath": "github.com/codegangsta/inject",
-			"Comment": "v1.0-rc1-4-g4b81725",
-			"Rev": "4b8172520a03fa190f427bbd284db01b459bfce7"
+			"Comment": "v1.0-rc1-10-g33e0aa1",
+			"Rev": "33e0aa1cb7c019ccc3fbe049a8262a6403d30504"
 		},
 		{
 			"ImportPath": "github.com/go-martini/martini",
-			"Comment": "v1.0-85-gbbd489b",
-			"Rev": "bbd489b35fd7eac9aaf442e5671ab21cdd972926"
+			"Comment": "v1.0-171-gc8e367e",
+			"Rev": "c8e367e964da242333b34f0cc2b01b91e16fa52a"
 		},
 		{
 			"ImportPath": "github.com/golang/protobuf/proto",
-			"Rev": "3ea3e05dbfae8d2dd0cc219b5f0f0ba4606d15eb"
+			"Rev": "5fc2294e655b78ed8a02082d37808d46c17d7e64"
 		},
 		{
 			"ImportPath": "github.com/layeh/gopus",
-			"Rev": "5bf552969d38ec85cb52809e3cc211bb75ad6121"
+			"Rev": "f312e86d7c7afea779f2503e3e26c22ee916c992"
 		},
 		{
 			"ImportPath": "github.com/layeh/gumble/gumble",
-			"Rev": "fdf1c7d8480d08fdedd1bfacdf496eb60c5c8e20"
+			"Rev": "3cbf8bdd14b067b3242f4f171b63cb2bb0236511"
 		},
 		{
-			"ImportPath": "github.com/layeh/gumble/gumble_ffmpeg",
-			"Rev": "fdf1c7d8480d08fdedd1bfacdf496eb60c5c8e20"
+			"ImportPath": "github.com/layeh/gumble/gumbleffmpeg",
+			"Rev": "3cbf8bdd14b067b3242f4f171b63cb2bb0236511"
 		},
 		{
 			"ImportPath": "github.com/layeh/gumble/gumbleutil",
-			"Rev": "fdf1c7d8480d08fdedd1bfacdf496eb60c5c8e20"
+			"Rev": "3cbf8bdd14b067b3242f4f171b63cb2bb0236511"
+		},
+		{
+			"ImportPath": "github.com/layeh/gumble/opus",
+			"Rev": "3cbf8bdd14b067b3242f4f171b63cb2bb0236511"
 		}
 	]
 }

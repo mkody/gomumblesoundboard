@@ -1,9 +1,9 @@
 package gopus
 
-// #cgo pkg-config: opus
-// #include "gopus.h"
+// #cgo !nopkgconfig pkg-config: opus
+// #include <opus.h>
 //
-// void gopus_resetstate(OpusDecoder *decoder) {
+// void gopus_decoder_resetstate(OpusDecoder *decoder) {
 //   opus_decoder_ctl(decoder, OPUS_RESET_STATE);
 // }
 import "C"
@@ -33,7 +33,10 @@ func NewDecoder(sampleRate, channels int) (*Decoder, error) {
 }
 
 func (d *Decoder) Decode(data []byte, frameSize int, fec bool) ([]int16, error) {
-	dataPtr := (*C.uchar)(unsafe.Pointer(&data[0]))
+	var dataPtr *C.uchar
+	if len(data) > 0 {
+		dataPtr = (*C.uchar)(unsafe.Pointer(&data[0]))
+	}
 	dataLen := C.opus_int32(len(data))
 
 	output := make([]int16, d.channels * frameSize)
@@ -56,7 +59,7 @@ func (d *Decoder) Decode(data []byte, frameSize int, fec bool) ([]int16, error) 
 }
 
 func (d *Decoder) ResetState() {
-	C.gopus_resetstate(d.cDecoder)
+	C.gopus_decoder_resetstate(d.cDecoder)
 }
 
 func CountFrames(data []byte) (int, error) {
