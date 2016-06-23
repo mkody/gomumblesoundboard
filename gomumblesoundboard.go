@@ -82,6 +82,22 @@ func main() {
 					return 200, fmt.Sprintf("Playing %s\n", file)
 				}
 			})
+			m.Get("/stream", func(params martini.Params) (int, string) {
+				file := "http://radiobrony.fr:8000/live"
+
+				if stream != nil && stream.State() == gumbleffmpeg.StatePlaying {
+					stream.Stop()
+				}
+
+				stream = gumbleffmpeg.New(e.Client, gumbleffmpeg.SourceFile(file))
+
+				if err := stream.Play(); err != nil {
+					return 400, fmt.Sprintf("%s\n", err)
+				} else {
+					stream.Volume = 0.02
+					return 200, fmt.Sprintf("Playing %s\n", file)
+				}
+			})
 			m.Get("/stop", func() string {
 				stream.Stop()
 				return "ok"

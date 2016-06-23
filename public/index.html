@@ -42,6 +42,24 @@
   .sound.fail {
     background-color: #F22613;
   }
+  .liveIcon {
+    font-size: 2em;
+    top: 3px;
+    color: red;
+    position: relative;
+    animation: blink-animation 1s steps(5, start) infinite;
+    -webkit-animation: blink-animation 1s steps(5, start) infinite;
+  }
+  @keyframes blink-animation {
+    to {
+      visibility: hidden;
+    }
+  }
+  @-webkit-keyframes blink-animation {
+    to {
+      visibility: hidden;
+    }
+  }
   </style>
 </head>
 <body>
@@ -86,6 +104,12 @@ get('/files.json').then(function(resp){
     btn.dataset.file = file;
     wrapEl.appendChild(btn);
   });
+  var btn = document.createElement("button");
+  btn.classList.add("sound");
+  btn.classList.add("play");
+  btn.innerHTML = "[<span class='liveIcon'>•</span>LIVE]";
+  btn.dataset.file = "stream";
+  wrapEl.appendChild(btn);
 });
 
 stopBtn.addEventListener('click', function(ev) {
@@ -96,13 +120,23 @@ document.addEventListener('click', function(ev) {
   if (!ev.target.classList.contains("play")) return;
   var el = ev.target,
       file = el.dataset.file;
-  get('/play/' + file).then(function() {
-    el.classList.add("done");
-    removeClassAfter(el, "done", 1000);
-  }).catch(function() {
-    el.classList.add("fail");
-    removeClassAfter(el, "fail", 1000);
-  });
+  if (file == "stream") {
+    get('/stream').then(function() {
+      el.classList.add("done");
+      removeClassAfter(el, "done", 1000);
+    }).catch(function() {
+      el.classList.add("fail");
+      removeClassAfter(el, "fail", 1000);
+    });
+  } else {
+    get('/play/' + file).then(function() {
+      el.classList.add("done");
+      removeClassAfter(el, "done", 1000);
+    }).catch(function() {
+      el.classList.add("fail");
+      removeClassAfter(el, "fail", 1000);
+    });
+  }
 }, false);
 </script>
 </body>
